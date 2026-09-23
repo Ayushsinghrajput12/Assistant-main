@@ -1,0 +1,527 @@
+"""
+RepoMind AI — FastAPI Application Entry Point
+
+Database stack:
+  - MongoDB (Motor)  → primary document store
+  - Qdrant           → vector semantic search
+  - Neo4j            → file dependency graph
+"""
+import logging
+import uuid
+from datetime import datetime
+from typing import List, Any, Optional
+
+from bson import ObjectId
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.db.mongo import init_db, close_db, get_collection
+from app.db.qdrant_client import init_qdrant_collections
+from app.db.redis_client import init_redis, close_redis
+
+from app.schemas import (
+    RepositoryCreate, RepositoryOut,
+    ChatSessionCreate, ChatSessionOut,
+    ChatMessageOut,
+    AgentActionLogOut,
+    KnowledgeObjectOut,
+)
+from app.services.github_service import GitHubService
+from app.services.sync_engine import SyncEngine
+from app.services.cleanup import run_startup_cleanup
+from app.agents.agent_graph import build_agent_graph, prune_structure
+
+logger = logging.getLogger(__name__)
+
+# ── App ────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="RepoMind AI Backend", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Lifecycle ──────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize all three database connections + run cleanup on startup."""
+    await init_db()
+    try:
+        await init_qdrant_collections()
+    except Exception as e:
+        logger.error(f"Failed to initialize Qdrant. The vector database is down or unreachable: {e}")
+    await init_redis()
+    logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Redis ✓")
+    # Purge orphan Qdrant vectors / Neo4j nodes for TTL-expired repos
+    try:
+        await run_startup_cleanup()
+    except Exception as e:
+        logger.warning(f"Startup cleanup had errors (non-fatal): {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully close all database connections."""
+    await close_db()
+    await close_redis()
+    logger.info("All database connections closed.")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _repo_doc_to_out(doc: dict) -> dict:
+    """Convert MongoDB repository document to RepositoryOut-compatible dict."""
+    doc = dict(doc)
+    doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+def _doc_to_out(doc: dict) -> dict:
+    """Generic MongoDB document normalizer: ObjectId → str id."""
+    doc = dict(doc)
+    if "_id" in doc:
+        doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+# ── REPOSITORY ENDPOINTS ───────────────────────────────────────────────────
+
+@app.post("/api/repositories", response_model=RepositoryOut, status_code=status.HTTP_201_CREATED)
+async def register_repository(payload: RepositoryCreate):
+    """Register a GitHub URL and run automatic deep scan + caching."""
+    url = payload.url.strip()
+    repos_col = get_collection("repositories")
+
+    # Check if already registered
+    existing = await repos_col.find_one({"url": url})
+    if existing:
+        return _repo_doc_to_out(existing)
+
+    try:
+        gh = GitHubService()
+        owner, repo_name = gh.parse_github_url(url)
+
+        # Insert skeleton document
+        new_repo = {
+            "url": url,
+            "owner": owner,
+            "name": repo_name,
+            "languages": {},
+            "frameworks": [],
+            "structure_json": None,
+            "last_commit_sha": None,
+            "etag_hash": None,
+            "created_at": datetime.utcnow(),
+        }
+        result = await repos_col.insert_one(new_repo)
+        repo_id = str(result.inserted_id)
+
+        # Run full sync (downloads files → MongoDB + Qdrant + Neo4j)
+        sync = SyncEngine(repo_id)
+        await sync.run_sync()
+
+        # Return refreshed document
+        refreshed = await repos_col.find_one({"_id": ObjectId(repo_id)})
+        return _repo_doc_to_out(refreshed)
+
+    except Exception as e:
+        # Cleanup orphan document on failure
+        try:
+            await repos_col.delete_one({"url": url})
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to process repository: {str(e)}",
+        )
+
+
+@app.post("/api/repositories/{repo_id}/sync", response_model=RepositoryOut)
+async def sync_repository(repo_id: str):
+    """Trigger an incremental sync for a registered repository."""
+    repos_col = get_collection("repositories")
+    doc = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    try:
+        sync = SyncEngine(repo_id)
+        repo = await sync.run_sync()
+        return _doc_to_out(repo) if isinstance(repo, dict) else repo
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Sync failed: {str(e)}",
+        )
+
+
+@app.get("/api/repositories", response_model=List[RepositoryOut])
+async def list_repositories():
+    repos_col = get_collection("repositories")
+    cursor = repos_col.find().sort("created_at", -1)
+    docs = await cursor.to_list(length=100)
+    return [_repo_doc_to_out(d) for d in docs]
+
+
+@app.get("/api/repositories/{repo_id}", response_model=RepositoryOut)
+async def get_repository(repo_id: str):
+    repos_col = get_collection("repositories")
+    doc = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    return _repo_doc_to_out(doc)
+
+
+@app.get("/api/repositories/{repo_id}/knowledge_objects", response_model=List[KnowledgeObjectOut])
+async def get_knowledge_objects(repo_id: str):
+    """Return the latest version of each Knowledge Object category."""
+    ko_col = get_collection("knowledge_objects")
+    cursor = ko_col.find({"repository_id": repo_id}).sort("version", -1)
+    all_kos = await cursor.to_list(length=500)
+
+    latest_by_category = {}
+    for ko in all_kos:
+        cat = ko["category"]
+        if cat not in latest_by_category:
+            ko = _doc_to_out(ko)
+            # Normalize embedded files list
+            ko["files"] = [{"file_path": f["file_path"]} for f in ko.get("files", [])]
+            latest_by_category[cat] = ko
+
+    return list(latest_by_category.values())
+
+
+@app.get("/api/repositories/{repo_id}/files")
+async def get_repository_file(repo_id: str, path: str):
+    """Fetch file content — MongoDB cache first, GitHub fallback."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    files_col = get_collection("repository_files")
+    cached = await files_col.find_one({"repository_id": repo_id, "path": path})
+    if cached:
+        return {"path": path, "content": cached["content"]}
+
+    try:
+        gh = GitHubService()
+        content = await gh.fetch_file_content(repo["owner"], repo["name"], path)
+
+        from app.db.qdrant_client import upsert_file_vector
+        result = await files_col.insert_one({
+            "repository_id": repo_id,
+            "path": path,
+            "content": content,
+            "last_updated": datetime.utcnow(),
+        })
+        await upsert_file_vector(str(result.inserted_id), repo_id, path, content[:500])
+        return {"path": path, "content": content}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to load file: {str(e)}",
+        )
+
+
+@app.get("/api/repositories/{repo_id}/commits")
+async def get_repository_commits(repo_id: str):
+    """Fetch recent commits for the repository."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    try:
+        gh = GitHubService()
+        commits = await gh.fetch_commits(repo["owner"], repo["name"])
+        return commits
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/repositories/{repo_id}/prs")
+async def get_repository_prs(repo_id: str):
+    """Fetch recent pull requests for the repository."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    try:
+        gh = GitHubService()
+        prs = await gh.fetch_pull_requests(repo["owner"], repo["name"])
+        return prs
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/repositories/{repo_id}/architecture")
+async def get_repository_architecture(repo_id: str):
+    """Generate a Mermaid architecture diagram using LLM."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    # 1. Check if we already have it cached
+    if repo.get("mermaid_architecture"):
+        return {"mermaid": repo["mermaid_architecture"]}
+        
+    tree_items = (repo.get("structure_json") or {}).get("tree", [])
+    file_list = prune_structure(tree_items)
+    
+    from app.services.architecture_mapper import generate_mermaid_architecture
+    mermaid_code = await generate_mermaid_architecture(repo, file_list)
+    
+    # 2. Save it to DB for next time
+    await repos_col.update_one(
+        {"_id": ObjectId(repo_id)},
+        {"$set": {"mermaid_architecture": mermaid_code}}
+    )
+    
+    return {"mermaid": mermaid_code}
+
+
+# ── CHAT SESSION ENDPOINTS ─────────────────────────────────────────────────
+
+@app.post("/api/sessions", response_model=ChatSessionOut, status_code=status.HTTP_201_CREATED)
+async def create_chat_session(payload: ChatSessionCreate):
+    repos_col = get_collection("repositories")
+    sessions_col = get_collection("chat_sessions")
+
+    repo = await repos_col.find_one({"_id": ObjectId(payload.repository_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    session_doc = {
+        "_id": str(uuid.uuid4()),
+        "repository_id": payload.repository_id,
+        "title": f"New chat — {repo['owner']}/{repo['name']}",
+        "created_at": datetime.utcnow(),
+    }
+    await sessions_col.insert_one(session_doc)
+
+    repo_out = _repo_doc_to_out(repo)
+    return {
+        "id": session_doc["_id"],
+        "repository_id": session_doc["repository_id"],
+        "title": session_doc["title"],
+        "created_at": session_doc["created_at"],
+        "repository": repo_out,
+        "message_count": 0,
+    }
+
+
+@app.get("/api/sessions", response_model=List[ChatSessionOut])
+async def list_chat_sessions(repository_id: Optional[str] = Query(None)):
+    """List sessions, optionally filtered by repository_id."""
+    sessions_col = get_collection("chat_sessions")
+    repos_col = get_collection("repositories")
+    messages_col = get_collection("chat_messages")
+
+    query_filter = {}
+    if repository_id:
+        query_filter["repository_id"] = repository_id
+
+    cursor = sessions_col.find(query_filter).sort("created_at", -1)
+    sessions = await cursor.to_list(length=200)
+
+    result = []
+    for s in sessions:
+        repo = await repos_col.find_one({"_id": ObjectId(s["repository_id"])})
+        session_id = s.pop("_id") if "_id" in s else s.get("id")
+        s["id"] = session_id
+        s["repository"] = _repo_doc_to_out(repo) if repo else None
+        # Count messages for this session
+        msg_count = await messages_col.count_documents({"session_id": session_id})
+        s["message_count"] = msg_count
+        result.append(s)
+    return result
+
+
+@app.delete("/api/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat_session(session_id: str):
+    """Delete a session and all its messages and agent logs."""
+    sessions_col = get_collection("chat_sessions")
+    messages_col = get_collection("chat_messages")
+    logs_col = get_collection("agent_action_logs")
+
+    session = await sessions_col.find_one({"_id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    await messages_col.delete_many({"session_id": session_id})
+    await logs_col.delete_many({"session_id": session_id})
+    await sessions_col.delete_one({"_id": session_id})
+
+
+@app.get("/api/sessions/{session_id}/messages", response_model=List[ChatMessageOut])
+async def get_session_messages(session_id: str):
+    messages_col = get_collection("chat_messages")
+    cursor = messages_col.find({"session_id": session_id}).sort("created_at", 1)
+    docs = await cursor.to_list(length=1000)
+    return [_doc_to_out(d) for d in docs]
+
+
+@app.get("/api/sessions/{session_id}/logs", response_model=List[AgentActionLogOut])
+async def get_session_agent_logs(session_id: str):
+    logs_col = get_collection("agent_action_logs")
+    cursor = logs_col.find({"session_id": session_id}).sort("created_at", 1)
+    docs = await cursor.to_list(length=2000)
+    return [_doc_to_out(d) for d in docs]
+
+
+# ── WEBSOCKET REAL-TIME CHAT ───────────────────────────────────────────────
+
+@app.websocket("/api/sessions/{session_id}/chat")
+async def chat_websocket(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+
+    try:
+        sessions_col = get_collection("chat_sessions")
+        repos_col = get_collection("repositories")
+
+        # Verify session
+        session = await sessions_col.find_one({"_id": session_id})
+        if not session:
+            await websocket.send_json({"type": "error", "message": "Session not found"})
+            await websocket.close()
+            return
+
+        repo = await repos_col.find_one({"_id": ObjectId(session["repository_id"])})
+        if not repo:
+            await websocket.send_json({"type": "error", "message": "Repository not found"})
+            await websocket.close()
+            return
+
+        repo_id = session["repository_id"]
+        owner = repo["owner"]
+        repo_name = repo["name"]
+        languages = repo.get("languages") or {}
+        frameworks = repo.get("frameworks") or []
+        tree_items = (repo.get("structure_json") or {}).get("tree", [])
+        file_list = prune_structure(tree_items)
+
+        messages_col = get_collection("chat_messages")
+        logs_col = get_collection("agent_action_logs")
+
+        is_first_message_in_session = True
+
+        while True:
+            data = await websocket.receive_json()
+            user_query = data.get("content", "").strip()
+            if not user_query:
+                continue
+
+            # Persist user message
+            await messages_col.insert_one({
+                "session_id": session_id,
+                "role": "user",
+                "content": user_query,
+                "created_at": datetime.utcnow(),
+            })
+
+            # Auto-title session from first user message
+            if is_first_message_in_session:
+                is_first_message_in_session = False
+                existing_msgs = await messages_col.count_documents({"session_id": session_id})
+                if existing_msgs <= 1:  # This is truly the first message
+                    title = user_query[:80] + ("..." if len(user_query) > 80 else "")
+                    await sessions_col.update_one(
+                        {"_id": session_id},
+                        {"$set": {"title": title}}
+                    )
+
+            # Log callback — persists to MongoDB and streams to WebSocket
+            async def log_callback(agent_name: str, action_type: str, message: str, data: Any = None):
+                await logs_col.insert_one({
+                    "session_id": session_id,
+                    "agent_name": agent_name,
+                    "action_type": action_type,
+                    "message": message,
+                    "data": data,
+                    "created_at": datetime.utcnow(),
+                })
+                await websocket.send_json({
+                    "type": "log",
+                    "agent": agent_name,
+                    "action": action_type,
+                    "message": message,
+                    "data": data,
+                })
+
+            # Stream callback — sends tokens one-by-one to frontend
+            async def stream_callback(token: str):
+                await websocket.send_json({
+                    "type": "stream",
+                    "token": token,
+                })
+
+            # Load recent conversation history to pass into the graph
+            # We fetch the last 6 turns (3 user + 3 assistant) for the sliding window
+            raw_history = await messages_col.find(
+                {"session_id": session_id}
+            ).sort("created_at", -1).limit(6).to_list(length=6)
+            chat_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in reversed(raw_history)
+            ]
+
+            # Build initial state — aligned with new Two-Stage AgentState schema
+            initial_state = {
+                "query": user_query,
+                "rewritten_query": "",
+                "owner": owner,
+                "repo": repo_name,
+                "branch": "main",
+                "repo_id": repo_id,
+                "file_list": file_list,
+                "languages": languages,
+                "frameworks": frameworks,
+                "retrieved_context": [],
+                "chat_history": chat_history,
+                "fallback_count": 0,
+                "session_id": session_id,
+                "final_answer": "",
+            }
+
+            graph = build_agent_graph()
+            config = {"configurable": {
+                "log_callback": log_callback,
+                "stream_callback": stream_callback,
+            }}
+
+            await log_callback("System", "info", "Starting agentic investigation graph...")
+            result_state = await graph.ainvoke(initial_state, config=config)
+            final_answer = result_state.get("final_answer", "Sorry, I was unable to complete the analysis.")
+
+            # Signal streaming is done
+            await websocket.send_json({"type": "stream_end"})
+
+            # Persist assistant message
+            await messages_col.insert_one({
+                "session_id": session_id,
+                "role": "assistant",
+                "content": final_answer,
+                "created_at": datetime.utcnow(),
+            })
+
+            await websocket.send_json({
+                "type": "message",
+                "role": "assistant",
+                "content": final_answer,
+            })
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: session={session_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": f"Server error: {str(e)}"})
+        except Exception:
+            pass
