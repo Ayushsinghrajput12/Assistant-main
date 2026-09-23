@@ -52,3 +52,7 @@ frontend/dist/
 # Temporary files
 *.tmp
 *.temp
+
+
+./settings.local.json
+.claude
